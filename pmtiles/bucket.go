@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -163,6 +165,32 @@ type HTTPClient interface {
 type HTTPBucket struct {
 	baseURL string
 	client  HTTPClient
+}
+
+// newDownloadClient returns an HTTP client for bulk range downloads.
+// http.DefaultClient keeps only 2 idle connections per host, so with more
+// download threads every extra request opens a new TCP+TLS connection.
+// HTTP/2 is disabled because it multiplexes all requests to a host over a
+// single TCP connection, which caps parallel range downloads at the
+// throughput of that one connection.
+func newDownloadClient(connections int) *http.Client {
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	// same settings as http.DefaultTransport, except the protocols and idle connections
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		Protocols:             protocols,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   max(connections, 2),
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{Transport: transport}
 }
 
 func (b HTTPBucket) NewRangeReader(ctx context.Context, key string, offset, length int64) (io.ReadCloser, error) {

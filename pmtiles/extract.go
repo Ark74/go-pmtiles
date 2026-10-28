@@ -13,6 +13,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -235,6 +236,238 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 	return result, totalBytes
 }
 
+// splitOverfetchRange cuts one merged request into consecutive requests of at
+// most maxLen source bytes, so that a single large range can be fetched over
+// several connections in parallel instead of dominating the tail of the
+// download on one connection.
+// Each piece carries its own DstOffset and CopyDiscards, so the bytes written
+// to the output are exactly the same as for the unsplit range.
+// Discarded bytes at the start or end of a piece are not requested.
+func splitOverfetchRange(or overfetchRange, maxLen uint64) []overfetchRange {
+	if maxLen == 0 || or.Rng.Length <= maxLen {
+		return []overfetchRange{or}
+	}
+
+	result := make([]overfetchRange, 0, or.Rng.Length/maxLen+1)
+	srcPos := or.Rng.SrcOffset
+	dstPos := or.Rng.DstOffset
+	var piece overfetchRange
+	open := false
+
+	flush := func() {
+		if !open {
+			return
+		}
+		last := &piece.CopyDiscards[len(piece.CopyDiscards)-1]
+		piece.Rng.Length -= last.Discard
+		last.Discard = 0
+		result = append(result, piece)
+		open = false
+	}
+
+	for _, cd := range or.CopyDiscards {
+		for wanted := cd.Wanted; wanted > 0; {
+			if !open {
+				piece = overfetchRange{Rng: srcDstRange{srcPos, dstPos, 0}}
+				open = true
+			}
+			n := min(wanted, maxLen-piece.Rng.Length)
+			if l := len(piece.CopyDiscards); l > 0 && piece.CopyDiscards[l-1].Discard == 0 {
+				piece.CopyDiscards[l-1].Wanted += n
+			} else {
+				piece.CopyDiscards = append(piece.CopyDiscards, copyDiscard{n, 0})
+			}
+			piece.Rng.Length += n
+			srcPos += n
+			dstPos += n
+			wanted -= n
+			if piece.Rng.Length == maxLen {
+				flush()
+			}
+		}
+		for discard := cd.Discard; discard > 0; {
+			if !open {
+				srcPos += discard
+				break
+			}
+			n := min(discard, maxLen-piece.Rng.Length)
+			piece.CopyDiscards[len(piece.CopyDiscards)-1].Discard += n
+			piece.Rng.Length += n
+			srcPos += n
+			discard -= n
+			if piece.Rng.Length == maxLen {
+				flush()
+			}
+		}
+	}
+	flush()
+	return result
+}
+
+// splitOverfetchRanges applies splitOverfetchRange to every range of the list,
+// keeping the list order, and returns the new list with its total transfer size.
+func splitOverfetchRanges(ranges *list.List, maxLen uint64) (*list.List, uint64) {
+	result := list.New()
+	totalBytes := uint64(0)
+	for e := ranges.Front(); e != nil; e = e.Next() {
+		for _, piece := range splitOverfetchRange(e.Value.(overfetchRange), maxLen) {
+			result.PushBack(piece)
+			totalBytes += piece.Rng.Length
+		}
+	}
+	return result, totalBytes
+}
+
+// sliceOverfetchRange returns the part of a request between the source bytes
+// from and to (relative to its SrcOffset), without leading or trailing
+// discarded bytes. It returns false when that part has no wanted bytes.
+func sliceOverfetchRange(or overfetchRange, from uint64, to uint64) (overfetchRange, bool) {
+	var piece overfetchRange
+	open := false
+	srcRel := uint64(0)
+	dstPos := or.Rng.DstOffset
+	for _, cd := range or.CopyDiscards {
+		lo := max(srcRel, from)
+		hi := min(srcRel+cd.Wanted, to)
+		if lo < hi {
+			if !open {
+				piece = overfetchRange{Rng: srcDstRange{or.Rng.SrcOffset + lo, dstPos + (lo - srcRel), 0}}
+				open = true
+			} else {
+				gap := or.Rng.SrcOffset + lo - (piece.Rng.SrcOffset + piece.Rng.Length)
+				piece.CopyDiscards[len(piece.CopyDiscards)-1].Discard += gap
+				piece.Rng.Length += gap
+			}
+			piece.CopyDiscards = append(piece.CopyDiscards, copyDiscard{hi - lo, 0})
+			piece.Rng.Length += hi - lo
+		}
+		srcRel += cd.Wanted + cd.Discard
+		dstPos += cd.Wanted
+		if srcRel >= to {
+			break
+		}
+	}
+	return piece, open
+}
+
+// minStealBytes is the smallest number of unread bytes of an in-flight request
+// that an idle download thread splits to take over the second half.
+const minStealBytes = 4 << 20
+
+// claimChunkBytes is how many bytes a request reader claims at a time;
+// a stolen request is cut at a claim boundary.
+const claimChunkBytes = 1 << 20
+
+// activeRange is a request being downloaded: its reader claims source bytes
+// (relative to or.Rng.SrcOffset) up to end, which another thread may lower.
+type activeRange struct {
+	or      overfetchRange
+	claimed uint64
+	end     uint64
+}
+
+// rangeScheduler hands the queued requests to the download threads. When the
+// queue is empty, an idle thread splits the in-flight request with the most
+// unread bytes and downloads its second half on a new connection, as aria2
+// does, so the last large requests do not leave all but one connection idle.
+type rangeScheduler struct {
+	mu       sync.Mutex
+	queue    *list.List
+	active   map[*activeRange]struct{}
+	minSteal uint64
+}
+
+func newRangeScheduler(queue *list.List, minSteal uint64) *rangeScheduler {
+	return &rangeScheduler{queue: queue, active: make(map[*activeRange]struct{}), minSteal: minSteal}
+}
+
+// next returns the next request to download, or nil when no work is left.
+func (s *rangeScheduler) next(fromBack bool) *activeRange {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for {
+		var or overfetchRange
+		if s.queue.Len() > 0 {
+			if fromBack {
+				or = s.queue.Remove(s.queue.Back()).(overfetchRange)
+			} else {
+				or = s.queue.Remove(s.queue.Front()).(overfetchRange)
+			}
+		} else {
+			var victim *activeRange
+			unread := uint64(0)
+			for a := range s.active {
+				if a.end-a.claimed > unread {
+					victim, unread = a, a.end-a.claimed
+				}
+			}
+			if victim == nil || unread < s.minSteal {
+				return nil
+			}
+			split := victim.claimed + unread/2
+			piece, ok := sliceOverfetchRange(victim.or, split, victim.end)
+			victim.end = split
+			if !ok {
+				continue
+			}
+			or = piece
+		}
+		a := &activeRange{or: or, end: or.Rng.Length}
+		s.active[a] = struct{}{}
+		return a
+	}
+}
+
+// claim reserves up to n more bytes of a for its reader and returns how many;
+// 0 means the request is finished.
+func (s *rangeScheduler) claim(a *activeRange, n uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n = min(n, a.end-a.claimed)
+	a.claimed += n
+	if n == 0 {
+		delete(s.active, a)
+	}
+	return n
+}
+
+// downloadActiveRange reads the claimed bytes of a from r and writes the wanted
+// ones to w at dstBase + their destination offset.
+func downloadActiveRange(s *rangeScheduler, a *activeRange, r io.Reader, w io.WriterAt, dstBase int64, buf []byte, progress io.Writer) error {
+	cdIdx, inCd := 0, uint64(0)
+	dstPos := a.or.Rng.DstOffset
+	for {
+		n := s.claim(a, uint64(len(buf)))
+		if n == 0 {
+			return nil
+		}
+		chunk := buf[:n]
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			return err
+		}
+		progress.Write(chunk)
+		for len(chunk) > 0 {
+			cd := a.or.CopyDiscards[cdIdx]
+			var k uint64
+			if inCd < cd.Wanted {
+				k = min(cd.Wanted-inCd, uint64(len(chunk)))
+				if _, err := w.WriteAt(chunk[:k], dstBase+int64(dstPos)); err != nil {
+					return err
+				}
+				dstPos += k
+			} else {
+				k = min(cd.Wanted+cd.Discard-inCd, uint64(len(chunk)))
+			}
+			inCd += k
+			chunk = chunk[k:]
+			if inCd == cd.Wanted+cd.Discard {
+				cdIdx++
+				inCd = 0
+			}
+		}
+	}
+}
+
 // Extract a smaller archive from local or remote archive.
 // 1. Get the root directory (check that it is clustered)
 // 2. Turn the input geometry into a relevance bitmap (using min(maxzoom, headermaxzoom))
@@ -250,7 +483,10 @@ func mergeRanges(ranges []srcDstRange, overfetch float32) (*list.List, uint64) {
 // 9. get and write the metadata.
 // 10. write the leaf directories (if any)
 // 11. Get all tiles, and write directly to the output.
-func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, dryRun bool) error {
+//
+// maxRequestBytes > 0 splits every tile request larger than that into
+// several requests, so that downloadThreads connections stay busy until the end.
+func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, maxRequestBytes int64, dryRun bool) error {
 	// 1. fetch the header
 	start := time.Now()
 
@@ -270,6 +506,11 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		return fmt.Errorf("Failed to open bucket for %s, %w", bucketURL, err)
 	}
 	defer bucket.Close()
+
+	if httpBucket, ok := bucket.(HTTPBucket); ok && httpBucket.client == http.DefaultClient {
+		httpBucket.client = newDownloadClient(downloadThreads)
+		bucket = httpBucket
+	}
 
 	r, err := bucket.NewRangeReader(ctx, key, 0, HeaderV3LenBytes)
 
@@ -446,6 +687,10 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 
 	overfetchRanges, totalBytes := mergeRanges(tileParts, overfetch)
 
+	if maxRequestBytes > 0 {
+		overfetchRanges, totalBytes = splitOverfetchRanges(overfetchRanges, uint64(maxRequestBytes))
+	}
+
 	numOverfetchRanges := overfetchRanges.Len()
 	logger.Printf("fetching %d tiles, %d chunks, %d requests\n", len(reencoded), len(tileParts), overfetchRanges.Len())
 
@@ -532,54 +777,25 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			"fetching chunks",
 		)
 
-		var mu sync.Mutex
-
-		downloadPart := func(or overfetchRange) error {
-			tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+or.Rng.SrcOffset), int64(or.Rng.Length))
-			if err != nil {
-				return err
-			}
-			offsetWriter := io.NewOffsetWriter(outfile, int64(header.TileDataOffset)+int64(or.Rng.DstOffset))
-
-			for _, cd := range or.CopyDiscards {
-
-				_, err := io.CopyN(io.MultiWriter(offsetWriter, bar), tileReader, int64(cd.Wanted))
-				if err != nil {
-					return err
-				}
-
-				_, err = io.CopyN(bar, tileReader, int64(cd.Discard))
-				if err != nil {
-					return err
-				}
-			}
-			tileReader.Close()
-			return nil
-		}
+		scheduler := newRangeScheduler(overfetchRanges, minStealBytes)
 
 		errs, _ := errgroup.WithContext(ctx)
 
 		for i := 0; i < downloadThreads; i++ {
 			workBack := (i == 0 && downloadThreads > 1)
 			errs.Go(func() error {
-				done := false
-				var or overfetchRange
+				buf := make([]byte, claimChunkBytes)
 				for {
-					mu.Lock()
-					if overfetchRanges.Len() == 0 {
-						done = true
-					} else {
-						if workBack {
-							or = overfetchRanges.Remove(overfetchRanges.Back()).(overfetchRange)
-						} else {
-							or = overfetchRanges.Remove(overfetchRanges.Front()).(overfetchRange)
-						}
-					}
-					mu.Unlock()
-					if done {
+					a := scheduler.next(workBack)
+					if a == nil {
 						return nil
 					}
-					err := downloadPart(or)
+					tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+a.or.Rng.SrcOffset), int64(a.or.Rng.Length))
+					if err != nil {
+						return err
+					}
+					err = downloadActiveRange(scheduler, a, tileReader, outfile, int64(header.TileDataOffset), buf, bar)
+					tileReader.Close()
 					if err != nil {
 						return err
 					}

@@ -361,9 +361,10 @@ type extractProgress struct {
 	w     io.Writer
 	start time.Time
 
-	mu      sync.Mutex
-	phase   string
-	samples []progressSample
+	mu       sync.Mutex
+	phase    string
+	exitCode *int
+	samples  []progressSample
 
 	bytesTotal    atomic.Uint64
 	resumedBytes  atomic.Uint64
@@ -391,6 +392,9 @@ type progressLine struct {
 	RequestsDone  int64    `json:"requests_done"`
 	RequestsTotal int64    `json:"requests_total"`
 	Retries       int64    `json:"retries"`
+	// ExitCode is set only on the terminal line (see finishOutcome): it names the
+	// process exit code so a consumer that reads stdout alone knows the outcome.
+	ExitCode *int `json:"exit_code,omitempty"`
 }
 
 const progressSpeedWindow = 5 * time.Second
@@ -494,6 +498,7 @@ func (p *extractProgress) emit() {
 		eta := 0.0
 		line.EtaS = &eta
 	}
+	line.ExitCode = p.exitCode
 	data, _ := json.Marshal(&line)
 	p.w.Write(append(data, '\n'))
 }
@@ -510,6 +515,55 @@ func (p *extractProgress) finish(phase string) {
 	} else {
 		p.emit()
 	}
+}
+
+// ExtractExitCode maps an Extract error to the process exit code. It is the one
+// source for that mapping: main() and the terminal progress line both use it.
+// 0 done, 1 other error, 2 network gave up (resumable), 3 paused (resumable),
+// 4 source changed (not resumable).
+func ExtractExitCode(err error) int {
+	var refresh *RefreshRequiredError
+	switch {
+	case err == nil:
+		return 0
+	case errors.Is(err, context.Canceled):
+		return 3
+	case errors.As(err, &refresh):
+		return 4
+	case errors.Is(err, ErrNetworkGaveUp):
+		return 2
+	default:
+		return 1
+	}
+}
+
+// extractOutcomePhase names the outcome for the terminal JSON progress line, so
+// a consumer that reads stdout alone can tell done from paused or failed without
+// the process exit code.
+func extractOutcomePhase(err error) string {
+	switch ExtractExitCode(err) {
+	case 0:
+		return "done"
+	case 3:
+		return "paused"
+	case 4:
+		return "source_changed"
+	default:
+		return "error"
+	}
+}
+
+// finishOutcome stops the ticker and writes one final line whose phase names the
+// outcome and whose exit_code equals the process exit code.
+func (p *extractProgress) finishOutcome(err error) {
+	if p == nil {
+		return
+	}
+	code := ExtractExitCode(err)
+	p.mu.Lock()
+	p.exitCode = &code
+	p.mu.Unlock()
+	p.finish(extractOutcomePhase(err))
 }
 
 // finalError marks an error that must not be retried, such as a failed write

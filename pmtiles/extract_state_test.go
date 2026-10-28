@@ -394,6 +394,28 @@ func TestExtractProgressLines(t *testing.T) {
 	nilProgress.finish("done")
 }
 
+func TestExtractOutcomeLine(t *testing.T) {
+	cases := []struct {
+		err     error
+		phase   string
+		codeStr string
+	}{
+		{nil, "done", "0"},
+		{context.Canceled, "paused", "3"},
+		{ErrNetworkGaveUp, "error", "2"},
+		{errors.New("boom"), "error", "1"},
+	}
+	for _, c := range cases {
+		var buf safeBuffer
+		p := newExtractProgress(&buf)
+		p.finishOutcome(c.err)
+		out := strings.TrimSpace(buf.String())
+		last := out[strings.LastIndex(out, "\n")+1:]
+		assert.Contains(t, last, `"phase":"`+c.phase+`"`)
+		assert.Contains(t, last, `"exit_code":`+c.codeStr)
+	}
+}
+
 type safeBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer

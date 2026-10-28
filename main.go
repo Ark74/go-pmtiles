@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -127,22 +126,6 @@ var cli struct {
 	} `cmd:"" help:"Show the program version"`
 }
 
-// extractExitCode: 1 other error, 2 network gave up (resumable),
-// 3 paused (resumable), 4 source changed (not resumable).
-func extractExitCode(err error) int {
-	var refresh *pmtiles.RefreshRequiredError
-	switch {
-	case errors.Is(err, context.Canceled):
-		return 3
-	case errors.As(err, &refresh):
-		return 4
-	case errors.Is(err, pmtiles.ErrNetworkGaveUp):
-		return 2
-	default:
-		return 1
-	}
-}
-
 func main() {
 	if len(os.Args) < 2 {
 		os.Args = append(os.Args, "--help")
@@ -214,7 +197,7 @@ func main() {
 		stop()
 		if err != nil {
 			logger.Printf("Failed to extract, %v", err)
-			os.Exit(extractExitCode(err))
+			os.Exit(pmtiles.ExtractExitCode(err))
 		}
 	case "cluster <input>":
 		err := pmtiles.Cluster(logger, cli.Cluster.Input, !cli.Cluster.NoDeduplication)

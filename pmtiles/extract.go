@@ -556,7 +556,7 @@ func downloadActiveRange(ctx context.Context, s *rangeScheduler, a *activeRange,
 // extract was interrupted; failed requests are retried. A non-nil
 // progressJSON receives one JSON progress line per second, and the
 // exact transfer size for a dry run.
-func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, maxRequestBytes int64, dryRun bool, progressJSON io.Writer) error {
+func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, maxRequestBytes int64, dryRun bool, progressJSON io.Writer) (retErr error) {
 	// 1. fetch the header
 	start := time.Now()
 
@@ -564,8 +564,9 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	if !dryRun {
 		progress = newExtractProgress(progressJSON)
 	}
-	finishPhase := ""
-	defer func() { progress.finish(finishPhase) }()
+	// The terminal JSON line names the outcome (done/paused/source_changed/error)
+	// and carries exit_code, derived from the error Extract returns.
+	defer func() { progress.finishOutcome(retErr) }()
 	onRetry := func(err error) {
 		progress.addRetry()
 		logger.Printf("retrying after error: %v\n", err)
@@ -1000,7 +1001,6 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			logger.Printf("Failed to remove resume journal %s, %v\n", journalPath, err)
 		}
 		totalBytes = remainingBytes
-		finishPhase = "done"
 	}
 
 	logger.Printf("Completed in %v with %v download threads (%v tiles/s).\n", time.Since(start), downloadThreads, float64(len(reencoded))/float64(time.Since(start).Seconds()))

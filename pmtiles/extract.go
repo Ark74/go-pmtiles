@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/dustin/go-humanize"
@@ -375,6 +377,7 @@ type rangeScheduler struct {
 	queue    *list.List
 	active   map[*activeRange]struct{}
 	minSteal uint64
+	issued   int64
 }
 
 func newRangeScheduler(queue *list.List, minSteal uint64) *rangeScheduler {
@@ -414,8 +417,24 @@ func (s *rangeScheduler) next(fromBack bool) *activeRange {
 		}
 		a := &activeRange{or: or, end: or.Rng.Length}
 		s.active[a] = struct{}{}
+		s.issued++
 		return a
 	}
+}
+
+// requestsTotal is the number of requests handed out plus those still queued;
+// it grows when a request is split.
+func (s *rangeScheduler) requestsTotal() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.issued + int64(s.queue.Len())
+}
+
+// end returns the source bytes (relative to a.or.Rng.SrcOffset) a must read.
+func (s *rangeScheduler) end(a *activeRange) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return a.end
 }
 
 // claim reserves up to n more bytes of a for its reader and returns how many;
@@ -431,29 +450,40 @@ func (s *rangeScheduler) claim(a *activeRange, n uint64) uint64 {
 	return n
 }
 
-// downloadActiveRange reads the claimed bytes of a from r and writes the wanted
-// ones to w at dstBase + their destination offset.
-func downloadActiveRange(s *rangeScheduler, a *activeRange, r io.Reader, w io.WriterAt, dstBase int64, buf []byte, progress io.Writer) error {
+// rangeOpener opens a reader of source bytes [srcOffset, srcOffset+length).
+type rangeOpener func(ctx context.Context, srcOffset uint64, length uint64) (io.ReadCloser, error)
+
+// downloadHooks observe a download.
+type downloadHooks struct {
+	transferred func(n uint64)                   // bytes read from the source
+	written     func(dstOffset uint64, n uint64) // tile bytes written at this tile-data offset
+	retried     func(err error)                  // a failed attempt that will be retried
+}
+
+// downloadActiveRange reads the claimed bytes of a and writes the wanted ones
+// to w at dstBase + their destination offset. A failed connection is reopened
+// at the first byte not yet read, following policy.
+func downloadActiveRange(ctx context.Context, s *rangeScheduler, a *activeRange, open rangeOpener, w io.WriterAt, dstBase int64, buf []byte, hooks downloadHooks, policy retryPolicy) error {
 	cdIdx, inCd := 0, uint64(0)
 	dstPos := a.or.Rng.DstOffset
-	for {
-		n := s.claim(a, uint64(len(buf)))
-		if n == 0 {
-			return nil
+	consumed, pending := uint64(0), uint64(0)
+	var r io.ReadCloser
+	defer func() {
+		if r != nil {
+			r.Close()
 		}
-		chunk := buf[:n]
-		if _, err := io.ReadFull(r, chunk); err != nil {
-			return err
-		}
-		progress.Write(chunk)
+	}()
+
+	write := func(chunk []byte) error {
 		for len(chunk) > 0 {
 			cd := a.or.CopyDiscards[cdIdx]
 			var k uint64
 			if inCd < cd.Wanted {
 				k = min(cd.Wanted-inCd, uint64(len(chunk)))
 				if _, err := w.WriteAt(chunk[:k], dstBase+int64(dstPos)); err != nil {
-					return err
+					return &finalError{err}
 				}
+				hooks.written(dstPos, k)
 				dstPos += k
 			} else {
 				k = min(cd.Wanted+cd.Discard-inCd, uint64(len(chunk)))
@@ -465,7 +495,42 @@ func downloadActiveRange(s *rangeScheduler, a *activeRange, r io.Reader, w io.Wr
 				inCd = 0
 			}
 		}
+		return nil
 	}
+
+	return retryRequest(ctx, policy, hooks.retried, func() (bool, error) {
+		progressed := false
+		for {
+			if pending == 0 {
+				pending = s.claim(a, uint64(len(buf)))
+				if pending == 0 {
+					return progressed, nil
+				}
+			}
+			if r == nil {
+				var err error
+				if r, err = open(ctx, a.or.Rng.SrcOffset+consumed, s.end(a)-consumed); err != nil {
+					r = nil
+					return progressed, err
+				}
+			}
+			got, err := io.ReadFull(r, buf[:pending])
+			if got > 0 {
+				progressed = true
+				hooks.transferred(uint64(got))
+				if werr := write(buf[:got]); werr != nil {
+					return progressed, werr
+				}
+				consumed += uint64(got)
+				pending -= uint64(got)
+			}
+			if err != nil {
+				r.Close()
+				r = nil
+				return progressed, err
+			}
+		}
+	})
 }
 
 // Extract a smaller archive from local or remote archive.
@@ -486,9 +551,25 @@ func downloadActiveRange(s *rangeScheduler, a *activeRange, r io.Reader, w io.Wr
 //
 // maxRequestBytes > 0 splits every tile request larger than that into
 // several requests, so that downloadThreads connections stay busy until the end.
-func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, maxRequestBytes int64, dryRun bool) error {
+//
+// The download resumes from <output>.resume when a previous run of the same
+// extract was interrupted; failed requests are retried. A non-nil
+// progressJSON receives one JSON progress line per second, and the
+// exact transfer size for a dry run.
+func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key string, minzoom int8, maxzoom int8, regionFile string, bbox string, output string, downloadThreads int, overfetch float32, maxRequestBytes int64, dryRun bool, progressJSON io.Writer) error {
 	// 1. fetch the header
 	start := time.Now()
+
+	var progress *extractProgress
+	if !dryRun {
+		progress = newExtractProgress(progressJSON)
+	}
+	finishPhase := ""
+	defer func() { progress.finish(finishPhase) }()
+	onRetry := func(err error) {
+		progress.addRetry()
+		logger.Printf("retrying after error: %v\n", err)
+	}
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -511,17 +592,21 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		httpBucket.client = newDownloadClient(downloadThreads)
 		bucket = httpBucket
 	}
-
-	r, err := bucket.NewRangeReader(ctx, key, 0, HeaderV3LenBytes)
-
-	if err != nil {
-		return fmt.Errorf("Failed to create range reader for %s, %w", key, err)
+	if httpBucket, ok := bucket.(HTTPBucket); ok {
+		httpBucket.client = strictRangeClient{httpBucket.client}
+		bucket = httpBucket
 	}
-	b, err := io.ReadAll(r)
+
+	b, etag, err := fetchRange(ctx, bucket, key, 0, HeaderV3LenBytes, "", defaultRetryPolicy, onRetry)
 	if err != nil {
-		return err
+		return fmt.Errorf("Failed to read header of %s, %w", key, err)
 	}
-	r.Close()
+	// Every later read must come from this same version of the source.
+	// A weak ETag cannot be used with If-Match.
+	pinnedETag := etag
+	if strings.HasPrefix(etag, "W/") {
+		pinnedETag = ""
+	}
 
 	header, err := DeserializeHeader(b[0:HeaderV3LenBytes])
 
@@ -616,12 +701,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	dirOffset := header.RootOffset
 	dirLength := header.RootLength
 
-	rootReader, err := bucket.NewRangeReader(ctx, key, int64(dirOffset), int64(dirLength))
-	if err != nil {
-		return err
-	}
-	defer rootReader.Close()
-	rootBytes, err := io.ReadAll(rootReader)
+	rootBytes, _, err := fetchRange(ctx, bucket, key, dirOffset, dirLength, pinnedETag, defaultRetryPolicy, onRetry)
 	if err != nil {
 		return err
 	}
@@ -647,18 +727,16 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		}
 		or := overfetchLeaves.Remove(overfetchLeaves.Front()).(overfetchRange)
 
-		chunkReader, err := bucket.NewRangeReader(ctx, key, int64(or.Rng.SrcOffset), int64(or.Rng.Length))
+		chunk, _, err := fetchRange(ctx, bucket, key, or.Rng.SrcOffset, or.Rng.Length, pinnedETag, defaultRetryPolicy, onRetry)
 		if err != nil {
 			return err
 		}
 
+		pos := uint64(0)
 		for _, cd := range or.CopyDiscards {
 
-			leafBytes := make([]byte, cd.Wanted)
-			_, err := io.ReadFull(chunkReader, leafBytes)
-			if err != nil {
-				return err
-			}
+			leafBytes := chunk[pos : pos+cd.Wanted]
+			pos += cd.Wanted + cd.Discard
 			leafdir := DeserializeEntries(bytes.NewBuffer(leafBytes), header.InternalCompression)
 			newEntries, newLeaves := RelevantEntries(relevantSet, uint8(maxzoom), leafdir)
 
@@ -666,13 +744,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 				panic("This doesn't support leaf level 2+.")
 			}
 			tileEntries = append(tileEntries, newEntries...)
-
-			_, err = io.CopyN(io.Discard, chunkReader, int64(cd.Discard))
-			if err != nil {
-				return err
-			}
 		}
-		chunkReader.Close()
 	}
 
 	sort.Slice(tileEntries, func(i, j int) bool {
@@ -725,19 +797,66 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 	for _, x := range tileParts {
 		totalActualBytes += x.Length
 	}
+	totalOutputSize := uint64(HeaderV3LenBytes) + uint64(len(newRootBytes)) + header.MetadataLength + uint64(len(newLeavesBytes)) + totalActualBytes
+
+	if dryRun && progressJSON != nil {
+		data, _ := json.Marshal(map[string]uint64{"transfer_bytes": totalBytes, "archive_bytes": totalOutputSize, "requests": uint64(numOverfetchRanges)})
+		progressJSON.Write(append(data, '\n'))
+	}
 
 	if !dryRun {
 
-		outfile, err := os.Create(output)
-		defer outfile.Close()
+		// resume a previous run of this same extract, or start over
+		journalPath := extractJournalPath(output)
+		state := extractJournal{
+			Version:          extractJournalVersion,
+			Bucket:           bucketURL,
+			Key:              key,
+			ETag:             etag,
+			SourceHeaderHash: sha256Hex(b),
+			PlanHash:         extractPlanHash(headerBytes, newRootBytes, newLeavesBytes, tileParts),
+			OutputSize:       totalOutputSize,
+			TileDataLength:   tiledataLength,
+		}
+		resuming := false
+		previous, err := loadExtractJournal(journalPath)
+		if err != nil {
+			logger.Printf("Ignoring unreadable resume journal %s: %v\n", journalPath, err)
+		} else if previous != nil {
+			info, statErr := os.Stat(output)
+			if !previous.resumes(&state) {
+				logger.Printf("Not resuming: %s was written for another extract or source version\n", journalPath)
+			} else if statErr != nil || uint64(info.Size()) != totalOutputSize {
+				logger.Printf("Not resuming: %s is missing or has an unexpected size\n", output)
+			} else {
+				state.Completed = previous.Completed
+				resuming = true
+			}
+		}
 
+		flags := os.O_RDWR | os.O_CREATE
+		if !resuming {
+			flags |= os.O_TRUNC
+			if err := removeExtractJournal(journalPath); err != nil {
+				return err
+			}
+		}
+		outfile, err := os.OpenFile(output, flags, 0644)
 		if err != nil {
 			return err
 		}
+		defer outfile.Close()
+
+		journal := newJournalWriter(journalPath, outfile, state)
 
 		// set the file size and write empty space for the header for now
 		// see comment below
-		outfile.Truncate(HeaderV3LenBytes + int64(len(newRootBytes)) + int64(header.MetadataLength) + int64(len(newLeavesBytes)) + int64(totalActualBytes))
+		if err := outfile.Truncate(int64(totalOutputSize)); err != nil {
+			return err
+		}
+		if err := journal.save(); err != nil {
+			return err
+		}
 		_, err = outfile.Write(make([]byte, HeaderV3LenBytes))
 		if err != nil {
 			return err
@@ -750,12 +869,7 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		}
 
 		// 9. get and write the metadata
-		metadataReader, err := bucket.NewRangeReader(ctx, key, int64(sourceMetadataOffset), int64(header.MetadataLength))
-		if err != nil {
-			return err
-		}
-		metadataBytes, err := io.ReadAll(metadataReader)
-		defer metadataReader.Close()
+		metadataBytes, _, err := fetchRange(ctx, bucket, key, sourceMetadataOffset, header.MetadataLength, pinnedETag, defaultRetryPolicy, onRetry)
 		if err != nil {
 			return err
 		}
@@ -771,15 +885,66 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 			return err
 		}
 
-		bar := defaultBytesProgressbar(
-			logger,
-			int64(totalBytes),
-			"fetching chunks",
-		)
+		// only request the tile bytes a previous run did not write
+		completed := journal.completedSet()
+		remaining := list.New()
+		remainingBytes := uint64(0)
+		for e := overfetchRanges.Front(); e != nil; e = e.Next() {
+			for _, piece := range missingOverfetchRanges(e.Value.(overfetchRange), completed) {
+				remaining.PushBack(piece)
+				remainingBytes += piece.Rng.Length
+			}
+		}
+		if resuming {
+			logger.Printf("Resuming %s: %s of %s tile data already written, %d requests left\n", output, humanize.Bytes(completed.total()), humanize.Bytes(tiledataLength), remaining.Len())
+		}
 
-		scheduler := newRangeScheduler(overfetchRanges, minStealBytes)
+		addToBar := func(int64) {}
+		if progress == nil && remainingBytes > 0 {
+			bar := defaultBytesProgressbar(
+				logger,
+				int64(remainingBytes),
+				"fetching chunks",
+			)
+			addToBar = func(n int64) { bar.Add64(n) }
+		}
 
-		errs, _ := errgroup.WithContext(ctx)
+		scheduler := newRangeScheduler(remaining, minStealBytes)
+		progress.startDownload(totalBytes, totalBytes-min(remainingBytes, totalBytes), scheduler.requestsTotal)
+
+		hooks := downloadHooks{
+			transferred: func(n uint64) {
+				addToBar(int64(n))
+				progress.addTransferred(n)
+			},
+			written: journal.record,
+			retried: onRetry,
+		}
+		open := func(ctx context.Context, srcOffset uint64, length uint64) (io.ReadCloser, error) {
+			r, _, _, err := bucket.NewRangeReaderEtag(ctx, key, int64(sourceTileDataOffset+srcOffset), int64(length), pinnedETag)
+			return r, err
+		}
+
+		// save the journal periodically while downloading
+		stopSaving := make(chan struct{})
+		saverDone := make(chan struct{})
+		go func() {
+			defer close(saverDone)
+			ticker := time.NewTicker(extractJournalSaveInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-stopSaving:
+					return
+				case <-ticker.C:
+					if err := journal.save(); err != nil {
+						logger.Printf("Failed to save resume journal, %v\n", err)
+					}
+				}
+			}
+		}()
+
+		errs, gctx := errgroup.WithContext(ctx)
 
 		for i := 0; i < downloadThreads; i++ {
 			workBack := (i == 0 && downloadThreads > 1)
@@ -790,21 +955,28 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 					if a == nil {
 						return nil
 					}
-					tileReader, err := bucket.NewRangeReader(ctx, key, int64(sourceTileDataOffset+a.or.Rng.SrcOffset), int64(a.or.Rng.Length))
-					if err != nil {
+					if err := downloadActiveRange(gctx, scheduler, a, open, outfile, int64(header.TileDataOffset), buf, hooks, defaultRetryPolicy); err != nil {
 						return err
 					}
-					err = downloadActiveRange(scheduler, a, tileReader, outfile, int64(header.TileDataOffset), buf, bar)
-					tileReader.Close()
-					if err != nil {
-						return err
-					}
+					progress.addRequestDone()
 				}
 			})
 		}
 
 		err = errs.Wait()
+		close(stopSaving)
+		<-saverDone
 		if err != nil {
+			if saveErr := journal.save(); saveErr != nil {
+				logger.Printf("Failed to save resume journal, %v\n", saveErr)
+			}
+			var refresh *RefreshRequiredError
+			if errors.As(err, &refresh) {
+				// the bytes already written belong to another version of the source
+				removeExtractJournal(journalPath)
+			} else {
+				logger.Printf("Download stopped; run the same command again to resume from %s\n", journalPath)
+			}
 			return err
 		}
 
@@ -812,11 +984,23 @@ func Extract(ctx context.Context, logger *log.Logger, bucketURL string, key stri
 		// otherwise a extract cancelled during the tile download section
 		// will appear valid with "pmtiles verify"
 		// even though the tile contents are corrupted.
+		progress.setPhase("finalize")
 		outfile.Seek(0, io.SeekStart)
 		_, err = outfile.Write(headerBytes)
 		if err != nil {
 			return err
 		}
+		if err := outfile.Sync(); err != nil {
+			return err
+		}
+		if err := outfile.Close(); err != nil {
+			return err
+		}
+		if err := removeExtractJournal(journalPath); err != nil {
+			logger.Printf("Failed to remove resume journal %s, %v\n", journalPath, err)
+		}
+		totalBytes = remainingBytes
+		finishPhase = "done"
 	}
 
 	logger.Printf("Completed in %v with %v download threads (%v tiles/s).\n", time.Since(start), downloadThreads, float64(len(reencoded))/float64(time.Since(start).Seconds()))

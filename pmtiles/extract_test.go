@@ -2,6 +2,7 @@ package pmtiles
 
 import (
 	"bytes"
+	"context"
 	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/stretchr/testify/assert"
 	"io"
@@ -318,9 +319,10 @@ func TestRangeSchedulerStealingSameOutput(t *testing.T) {
 					mu.Lock()
 					requests++
 					mu.Unlock()
-					off := a.or.Rng.SrcOffset
-					r := slowReader{bytes.NewReader(src[off : off+a.or.Rng.Length]), delay}
-					assert.NoError(t, downloadActiveRange(scheduler, a, r, got, 5, buf, io.Discard))
+					open := func(_ context.Context, off uint64, n uint64) (io.ReadCloser, error) {
+						return io.NopCloser(slowReader{bytes.NewReader(src[off : off+n]), delay}), nil
+					}
+					assert.NoError(t, downloadActiveRange(context.Background(), scheduler, a, open, got, 5, buf, noHooks, defaultRetryPolicy))
 				}
 			}(w == 0, time.Duration(rnd.Intn(2))*time.Microsecond)
 		}

@@ -53,6 +53,14 @@ func retryableExtractError(err error) bool {
 	if errors.As(err, &refresh) || errors.As(err, &final) || errors.Is(err, ErrRangeNotHonored) {
 		return false
 	}
+	// Local filesystem errors (missing input, permission, no space) are not
+	// transient: fail fast with the real cause instead of retrying them as a
+	// network blip (otherwise a full disk wastes the retry budget and reports
+	// "network gave up").
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return false
+	}
 	var status *HTTPStatusError
 	if errors.As(err, &status) {
 		return status.StatusCode >= 500 || status.StatusCode == 408 || status.StatusCode == 429
